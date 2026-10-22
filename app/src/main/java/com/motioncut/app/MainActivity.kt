@@ -112,6 +112,10 @@ private fun MotioncutEditor(activity: ComponentActivity) {
     var edit by remember { mutableStateOf(EditSettings()) }
     var tool by remember { mutableStateOf(EditorTool.TRIM) }
 
+    // True once frame effects have been handed to the player, so they can be
+    // cleared again. Until then the player is never touched.
+    var previewEffectsActive by remember { mutableStateOf(false) }
+
     var status by remember {
         mutableStateOf("import a video to get started")
     }
@@ -430,8 +434,6 @@ private fun MotioncutEditor(activity: ComponentActivity) {
 
     // Preview of the edit settings. Speed and volume use the player's own
     // controls; rotate, flip and crop use the same effects the exporter gets.
-    // With no frame changes the effect list is empty and the plain render
-    // path is used.
     LaunchedEffect(edit.speed) {
         player.setPlaybackSpeed(edit.speed)
     }
@@ -441,7 +443,14 @@ private fun MotioncutEditor(activity: ComponentActivity) {
     }
 
     LaunchedEffect(edit.rotationDegrees, edit.flipHorizontal, edit.aspect) {
-        player.setVideoEffects(buildFrameEffects(edit))
+        val frameEffects = buildFrameEffects(edit)
+
+        // With no frame edits, and none applied before, the player is left
+        // exactly as it was for plain trimming.
+        if (frameEffects.isEmpty() && !previewEffectsActive) return@LaunchedEffect
+
+        player.setVideoEffects(frameEffects)
+        previewEffectsActive = frameEffects.isNotEmpty()
 
         // Redraw the current frame with the new effects.
         if (player.mediaItemCount > 0) player.seekTo(player.currentPosition)
