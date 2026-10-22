@@ -1,7 +1,6 @@
 package com.motioncut.app
 
 import android.content.Context
-import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
@@ -12,16 +11,17 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -32,6 +32,7 @@ import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -40,23 +41,23 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
+import kotlin.math.roundToInt
 
 private const val TAG = "Motioncut"
 private const val EXPORT_TEMP_FILE_NAME = "motioncut-export.mp4"
+private const val STATUS_READY = "video ready"
 
 /** How often preview playback checks whether it has reached the trim end. */
 private const val PREVIEW_POLL_INTERVAL_MS = 30L
 
-private val Background = Color(0xFF101010)
-private val Panel = Color(0xFF1C1C1C)
-private val Accent = Color(0xFFB7F397)
-private val TextMain = Color(0xFFF4F4F4)
-private val TextMuted = Color(0xFFAAAAAA)
+/** How often the export progress bar asks Transformer for its progress. */
+private const val PROGRESS_POLL_INTERVAL_MS = 250L
 
-/** The source and trim range as they were when the user tapped Export. */
+/** The source, trim range and edit settings as they were when the user tapped Export. */
 private data class ExportRequest(
     val sourceUri: Uri,
-    val range: TrimRange
+    val range: TrimRange,
+    val settings: EditSettings
 )
 
 /** A Transformer export that is still running, and the files it owns. */
@@ -87,9 +88,11 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(UnstableApi::class, ExperimentalMaterial3Api::class)
+@OptIn(UnstableApi::class)
 @Composable
-private fun MotioncutEditor(context: Context) {
+private fun MotioncutEditor(activity: ComponentActivity) {
+    val context: Context = activity
+
     val player = remember {
         ExoPlayer.Builder(context).build()
     }
@@ -97,20 +100,38 @@ private fun MotioncutEditor(context: Context) {
     val scope = rememberCoroutineScope()
 
     var sourceUri by remember { mutableStateOf<Uri?>(null) }
+    var sourceName by remember { mutableStateOf<String?>(null) }
+    var sourceInfo by remember { mutableStateOf<VideoInfo?>(null) }
 
     // Single source of truth for the selection. Null until the loaded video
     // reports a usable duration. Only the slider changes it, and it is
     // replaced (not edited) when a different video is opened.
     var trim by remember { mutableStateOf<TrimRange?>(null) }
+
+    // Speed, volume, rotate, flip and crop. Shared by the preview and the export.
+    var edit by remember { mutableStateOf(EditSettings()) }
+    var tool by remember { mutableStateOf(EditorTool.TRIM) }
+
     var status by remember {
         mutableStateOf("import a video to get started")
     }
     var isPlaying by remember { mutableStateOf(false) }
     var exporting by remember { mutableStateOf(false) }
+    var exportProgress by remember { mutableStateOf<Float?>(null) }
 
     // Set when Export is tapped, cleared when the destination picker returns.
     var pendingExport by remember { mutableStateOf<ExportRequest?>(null) }
     var activeExport by remember { mutableStateOf<ActiveExport?>(null) }
+
+    // Editing after an export makes its result message stale, so drop it.
+    fun markEdited() {
+        if (!exporting) status = STATUS_READY
+    }
+
+    fun updateEdit(change: (EditSettings) -> EditSettings) {
+        edit = change(edit)
+        markEdited()
+    }
 
     val openVideo = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -127,12 +148,27 @@ private fun MotioncutEditor(context: Context) {
             }
 
             sourceUri = uri
+            sourceName = null
+            sourceInfo = null
             trim = null
+            edit = EditSettings()
             status = "loading video…"
 
             player.pause()
             player.setMediaItem(MediaItem.fromUri(uri))
             player.prepare()
+
+            scope.launch {
+                val (name, info) = withContext(Dispatchers.IO) {
+                    displayName(context, uri) to probeVideo(context, uri)
+                }
+
+                // Ignore the result if another video was opened meanwhile.
+                if (sourceUri == uri) {
+                    sourceName = name
+                    sourceInfo = info
+                }
+            }
         }
     }
 
@@ -158,9 +194,11 @@ private fun MotioncutEditor(context: Context) {
         }
 
         val range = request.range
+        val settings = request.settings
 
         player.pause()
         exporting = true
+        exportProgress = null
         status = "exporting MP4…"
 
         val temporaryFile = File(
@@ -173,6 +211,8 @@ private fun MotioncutEditor(context: Context) {
         }
 
         // Media3 1.5.1 takes these in milliseconds, the same unit as TrimRange.
+        // Trimming is applied to the source first; the effects below then
+        // work on the trimmed clip.
         val clipping = MediaItem.ClippingConfiguration.Builder()
             .setStartPositionMs(range.startMs)
             .setEndPositionMs(range.endMs)
@@ -183,10 +223,23 @@ private fun MotioncutEditor(context: Context) {
             .setClippingConfiguration(clipping)
             .build()
 
-        val editedItem = EditedMediaItem.Builder(clippedMediaItem)
-            .build()
+        val editedItemBuilder = EditedMediaItem.Builder(clippedMediaItem)
+            .setRemoveAudio(settings.muted)
 
-        Log.i(TAG, "Starting export: start=${range.startMs}ms end=${range.endMs}ms")
+        // With nothing to change, no effects are set and the export takes the
+        // same path that was verified for plain trimming.
+        val effects = buildExportEffects(settings)
+        if (effects.audioProcessors.isNotEmpty() || effects.videoEffects.isNotEmpty()) {
+            editedItemBuilder.setEffects(effects)
+        }
+
+        val editedItem = editedItemBuilder.build()
+
+        Log.i(
+            TAG,
+            "Starting export: start=${range.startMs}ms end=${range.endMs}ms " +
+                "settings=$settings"
+        )
 
         try {
             val transformer = Transformer.Builder(context)
@@ -203,8 +256,8 @@ private fun MotioncutEditor(context: Context) {
 
                             scope.launch {
                                 try {
-                                    val actualDurationMs = withContext(Dispatchers.IO) {
-                                        val measured = readDurationMs(temporaryFile)
+                                    val output = withContext(Dispatchers.IO) {
+                                        val measured = probeVideoFile(temporaryFile)
                                         copyToDestination(
                                             context,
                                             temporaryFile,
@@ -213,12 +266,7 @@ private fun MotioncutEditor(context: Context) {
                                         measured
                                     }
 
-                                    Log.i(
-                                        TAG,
-                                        "Export finished: expected=${range.lengthMs}ms " +
-                                            "actual=${actualDurationMs}ms"
-                                    )
-                                    status = exportCompleteMessage(range, actualDurationMs)
+                                    status = exportCompleteMessage(range, settings, output)
                                 } catch (e: Exception) {
                                     if (e is CancellationException) throw e
 
@@ -280,7 +328,7 @@ private fun MotioncutEditor(context: Context) {
                             val initial = TrimRange.full(player.duration)
                             if (initial != null) {
                                 trim = initial
-                                status = "video ready"
+                                status = STATUS_READY
                             }
                         }
                     }
@@ -338,6 +386,16 @@ private fun MotioncutEditor(context: Context) {
         }
     }
 
+    // Leaving the app pauses the preview instead of playing on in the background.
+    DisposableEffect(activity) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) player.pause()
+        }
+
+        activity.lifecycle.addObserver(observer)
+        onDispose { activity.lifecycle.removeObserver(observer) }
+    }
+
     // Stop preview at the selected end. Restarts whenever playback starts or
     // stops or the selection changes, so dragging a handle during playback
     // is picked up immediately.
@@ -353,10 +411,64 @@ private fun MotioncutEditor(context: Context) {
         player.seekTo(range.startMs)
     }
 
+    // Real export progress, polled from Transformer while it is running.
+    LaunchedEffect(activeExport) {
+        val export = activeExport
+        if (export == null) {
+            exportProgress = null
+            return@LaunchedEffect
+        }
+
+        val holder = ProgressHolder()
+        while (true) {
+            if (export.transformer.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) {
+                exportProgress = holder.progress / 100f
+            }
+            delay(PROGRESS_POLL_INTERVAL_MS)
+        }
+    }
+
+    // Preview of the edit settings. Speed and volume use the player's own
+    // controls; rotate, flip and crop use the same effects the exporter gets.
+    // With no frame changes the effect list is empty and the plain render
+    // path is used.
+    LaunchedEffect(edit.speed) {
+        player.setPlaybackSpeed(edit.speed)
+    }
+
+    LaunchedEffect(edit.effectiveVolume) {
+        player.volume = edit.effectiveVolume
+    }
+
+    LaunchedEffect(edit.rotationDegrees, edit.flipHorizontal, edit.aspect) {
+        player.setVideoEffects(buildFrameEffects(edit))
+
+        // Redraw the current frame with the new effects.
+        if (player.mediaItemCount > 0) player.seekTo(player.currentPosition)
+    }
+
     val range = trim
-    val sliderStart = (range?.startMs ?: 0L).toFloat()
-    val sliderEnd = (range?.endMs ?: 1L).toFloat()
-    val sliderMax = (range?.durationMs ?: 1L).toFloat()
+    val controlsEnabled = range != null && !exporting
+    val canExport = sourceUri != null &&
+        range != null &&
+        !exporting &&
+        pendingExport == null
+
+    val subtitle = if (sourceUri == null) {
+        "VIDEO EDITOR  •  0.1.0"
+    } else {
+        listOfNotNull(
+            sourceName ?: sourceUri?.lastPathSegment,
+            sourceInfo?.resolutionLabel,
+            range?.let { formatTime(it.durationMs) }
+        ).joinToString("  ·  ")
+    }
+
+    val exportLabel = if (activeExport != null) {
+        exportProgress?.let { "exporting ${(it * 100).roundToInt()}%" } ?: "preparing export…"
+    } else {
+        "saving file…"
+    }
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -365,25 +477,27 @@ private fun MotioncutEditor(context: Context) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+                .systemBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = "motioncut",
-                        style = MaterialTheme.typography.headlineMedium,
+                        style = MaterialTheme.typography.titleLarge,
                         color = TextMain
                     )
                     Text(
-                        text = "VIDEO EDITOR  •  0.1.0",
+                        text = subtitle,
                         style = MaterialTheme.typography.labelSmall,
-                        color = TextMuted
+                        color = TextMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
 
@@ -397,135 +511,35 @@ private fun MotioncutEditor(context: Context) {
                 }
             }
 
-            Column(
+            // The preview takes all the height the editing dock below leaves.
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Panel, RoundedCornerShape(18.dp))
-                    .padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                    .weight(1f)
+                    .heightIn(min = 160.dp)
+                    .background(Color.Black, RoundedCornerShape(12.dp)),
+                contentAlignment = Alignment.Center
             ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(220.dp)
-                        .background(Color.Black, RoundedCornerShape(12.dp)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (sourceUri != null) {
-                        AndroidView(
-                            modifier = Modifier.fillMaxSize(),
-                            factory = { viewContext ->
-                                PlayerView(viewContext).apply {
-                                    useController = true
-                                    resizeMode =
-                                        AspectRatioFrameLayout.RESIZE_MODE_FIT
-                                    this.player = player
-                                }
-                            },
-                            update = { view ->
-                                view.player = player
+                if (sourceUri != null) {
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { viewContext ->
+                            PlayerView(viewContext).apply {
+                                useController = true
+                                resizeMode =
+                                    AspectRatioFrameLayout.RESIZE_MODE_FIT
+                                this.player = player
                             }
-                        )
-                    } else {
-                        Text(
-                            text = "your preview appears here",
-                            color = TextMuted
-                        )
-                    }
-                }
-
-                Text(
-                    text = sourceUri?.lastPathSegment
-                        ?: "no video selected",
-                    color = TextMuted,
-                    style = MaterialTheme.typography.bodySmall
-                )
-            }
-
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Panel, RoundedCornerShape(18.dp))
-                    .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(
-                    text = "TRIM CLIP",
-                    style = MaterialTheme.typography.titleMedium
-                )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        text = "start  ${formatTime(range?.startMs ?: 0L)}",
-                        color = TextMain
-                    )
-                    Text(
-                        text = "end  ${formatTime(range?.endMs ?: 0L)}",
-                        color = TextMain
-                    )
-                }
-
-                // One track for the whole video: both thumbs share the
-                // 0..duration scale, so neither can move the other.
-                RangeSlider(
-                    value = sliderStart..sliderEnd,
-                    onValueChange = { values ->
-                        val current = trim
-                        if (current != null) {
-                            val updated = current.withSliderValues(
-                                values.start,
-                                values.endInclusive
-                            )
-
-                            if (updated != current) {
-                                trim = updated
-
-                                // Show the frame under the handle being dragged.
-                                if (updated.startMs != current.startMs) {
-                                    player.seekTo(updated.startMs)
-                                } else {
-                                    player.seekTo(updated.endMs)
-                                }
-                            }
+                        },
+                        update = { view ->
+                            view.player = player
                         }
-                    },
-                    valueRange = 0f..sliderMax,
-                    enabled = range != null && !exporting,
-                    colors = SliderDefaults.colors(
-                        thumbColor = Accent,
-                        activeTrackColor = Accent
                     )
-                )
-
-                Text(
-                    text = "selected duration: ${formatTime(range?.lengthMs ?: 0L)}" +
-                        (range?.let { " of ${formatTime(it.durationMs)}" } ?: ""),
-                    color = TextMuted,
-                    style = MaterialTheme.typography.bodySmall
-                )
-
-                Button(
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = sourceUri != null &&
-                        range != null &&
-                        !exporting &&
-                        pendingExport == null,
-                    onClick = {
-                        val source = sourceUri
-                        val selected = trim
-
-                        if (source != null && selected != null) {
-                            // The range is captured here, once, and used
-                            // unchanged for the whole export.
-                            pendingExport = ExportRequest(source, selected)
-                            saveVideo.launch("Motioncut-export.mp4")
-                        }
-                    }
-                ) {
-                    Text(if (exporting) "Exporting…" else "Export MP4")
+                } else {
+                    Text(
+                        text = "your preview appears here",
+                        color = TextMuted
+                    )
                 }
             }
 
@@ -533,18 +547,131 @@ private fun MotioncutEditor(context: Context) {
                 text = status,
                 color = if (status.contains("failed") ||
                     status.contains("error")) {
-                    Color(0xFFFF8A80)
+                    Danger
                 } else {
                     Accent
                 },
-                style = MaterialTheme.typography.bodyMedium
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
             )
 
-            Text(
-                text = "v0.1 • single-clip editing • offline",
-                color = TextMuted,
-                style = MaterialTheme.typography.labelSmall
-            )
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Panel, RoundedCornerShape(18.dp))
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                ToolTabs(
+                    selected = tool,
+                    onSelect = { tool = it }
+                )
+
+                // Fixed minimum height so switching tools never resizes the preview.
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 104.dp)
+                ) {
+                    when (tool) {
+                        EditorTool.TRIM -> TrimPanel(
+                            range = range,
+                            enabled = controlsEnabled,
+                            onSliderValues = { startValue, endValue ->
+                                val current = trim
+                                if (current != null) {
+                                    val updated = current.withSliderValues(
+                                        startValue,
+                                        endValue
+                                    )
+
+                                    if (updated != current) {
+                                        trim = updated
+                                        markEdited()
+
+                                        // Show the frame under the handle being dragged.
+                                        if (updated.startMs != current.startMs) {
+                                            player.seekTo(updated.startMs)
+                                        } else {
+                                            player.seekTo(updated.endMs)
+                                        }
+                                    }
+                                }
+                            }
+                        )
+
+                        EditorTool.SPEED -> SpeedPanel(
+                            speed = edit.speed,
+                            enabled = controlsEnabled,
+                            clipLengthMs = range?.lengthMs,
+                            onSpeed = { value -> updateEdit { it.copy(speed = value) } }
+                        )
+
+                        EditorTool.AUDIO -> AudioPanel(
+                            volume = edit.volume,
+                            muted = edit.muted,
+                            enabled = controlsEnabled,
+                            onVolume = { value -> updateEdit { it.copy(volume = value) } },
+                            onMuted = { value -> updateEdit { it.copy(muted = value) } }
+                        )
+
+                        EditorTool.ROTATE -> RotatePanel(
+                            rotationDegrees = edit.rotationDegrees,
+                            flipHorizontal = edit.flipHorizontal,
+                            enabled = controlsEnabled,
+                            onRotate = { updateEdit { it.rotatedClockwise() } },
+                            onFlip = {
+                                updateEdit { it.copy(flipHorizontal = !it.flipHorizontal) }
+                            },
+                            onReset = {
+                                updateEdit {
+                                    it.copy(rotationDegrees = 0, flipHorizontal = false)
+                                }
+                            }
+                        )
+
+                        EditorTool.CROP -> CropPanel(
+                            selected = edit.aspect,
+                            enabled = controlsEnabled,
+                            onSelect = { value -> updateEdit { it.copy(aspect = value) } }
+                        )
+                    }
+                }
+
+                ExportBar(
+                    exporting = exporting,
+                    canExport = canExport,
+                    progress = exportProgress,
+                    label = exportLabel,
+                    canCancel = activeExport != null,
+                    onExport = {
+                        val source = sourceUri
+                        val selected = trim
+
+                        if (source != null && selected != null) {
+                            // The range and settings are captured here, once,
+                            // and used unchanged for the whole export.
+                            pendingExport = ExportRequest(source, selected, edit)
+                            saveVideo.launch("Motioncut-export.mp4")
+                        }
+                    },
+                    onCancel = {
+                        val export = activeExport
+                        if (export != null) {
+                            export.transformer.cancel()
+                            activeExport = null
+                            discardUnfinishedExport(
+                                context,
+                                export.destination,
+                                export.temporaryFile
+                            )
+                            exporting = false
+                            status = "export cancelled"
+                        }
+                    }
+                )
+            }
         }
     }
 }
@@ -558,38 +685,29 @@ private fun copyToDestination(context: Context, source: File, destination: Uri) 
     }
 }
 
-/** Duration of a finished export as the platform reads it, or null if unreadable. */
-private fun readDurationMs(file: File): Long? {
-    val retriever = MediaMetadataRetriever()
-    return try {
-        retriever.setDataSource(file.absolutePath)
-        retriever
-            .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-            ?.toLongOrNull()
-    } catch (e: RuntimeException) {
-        Log.w(TAG, "Could not read the exported file's duration", e)
-        null
-    } finally {
-        retriever.release()
-    }
-}
+/** Reports the real size and length of the exported file, not the requested ones. */
+private fun exportCompleteMessage(
+    range: TrimRange,
+    settings: EditSettings,
+    output: VideoInfo
+): String {
+    val actualMs = output.durationMs
+        ?: return "export complete (the output could not be inspected)"
+    val expectedMs = settings.outputDurationMs(range.lengthMs)
+    val details = listOfNotNull(output.resolutionLabel, formatTime(actualMs))
+        .joinToString("  ·  ")
 
-private fun exportCompleteMessage(range: TrimRange, actualDurationMs: Long?): String {
-    if (actualDurationMs == null) {
-        return "export complete (its duration could not be checked)"
-    }
-
-    if (isExportDurationClose(range.lengthMs, actualDurationMs)) {
-        return "export complete"
+    if (isExportDurationClose(expectedMs, actualMs)) {
+        return "export complete  ·  $details"
     }
 
     Log.w(
         TAG,
         "Exported duration differs from selection: " +
-            "expected=${range.lengthMs}ms actual=${actualDurationMs}ms"
+            "expected=${expectedMs}ms actual=${actualMs}ms"
     )
-    return "export complete, but the file is ${formatTime(actualDurationMs)} long " +
-        "and the selection was ${formatTime(range.lengthMs)}"
+    return "export complete, but the file is ${formatTime(actualMs)} long " +
+        "and ${formatTime(expectedMs)} was expected"
 }
 
 /**

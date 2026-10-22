@@ -5,9 +5,13 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
 
+        <!-- Rotation and similar changes are handled by Compose instead of
+             recreating the Activity, so the trim range, edit settings and a
+             running export survive them. -->
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
